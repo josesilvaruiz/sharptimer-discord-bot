@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+last_known_buildid.txt
+last_patchnotes_message_id.txt
+*.bak
