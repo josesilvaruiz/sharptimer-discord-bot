@@ -1,8 +1,9 @@
 """
 SharpTimer Leaderboard Bot
 --------------------------
-Lee directamente la base de datos MariaDB que usa SharpTimer (solo lectura,
-no escribe nada) y muestra rankings en Discord con slash commands.
+Lee el ranking a través de la ranking API (https://github.com/josesilvaruiz/sharptimer-ranking-api),
+que es la única que toca la base de datos MariaDB de SharpTimer — el bot ya no se
+conecta a ella directamente. Muestra rankings en Discord con slash commands.
 
 Comandos:
     /top [cantidad]            -> Ranking global por puntos (sistema propio del bot)
@@ -11,7 +12,7 @@ Comandos:
     /maps                      -> Lista todos los mapas con records guardados
 
 Requisitos:
-    pip install --break-system-packages -U discord.py pymysql
+    pip install --break-system-packages -U discord.py aiohttp
 
 Configura las variables en el bloque CONFIG más abajo.
 """
@@ -23,24 +24,22 @@ import asyncio
 import subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import pymysql
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 # ============== CONFIG ==============
-# Token y password de BD se leen del entorno (nunca hardcodeados aquí, para poder subir
-# este fichero a un repo git). Configúralos en el servicio systemd / .env antes de arrancar:
-#   DISCORD_TOKEN, DB_PASSWORD
+# Token y API key se leen del entorno (nunca hardcodeados aquí, para poder subir este
+# fichero a un repo git). Configúralos en el servicio systemd / .env antes de arrancar:
+#   DISCORD_TOKEN, RANKING_API_KEY
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 
-# Conexion a MariaDB (las mismas credenciales que usa SharpTimer)
-DB_HOST = "127.0.0.1"
-DB_PORT = 3306
-DB_USER = "sharptimer_user"
-DB_PASSWORD = os.environ["DB_PASSWORD"]
-DB_NAME = "sharptimer_db"
+# El bot ya no toca MariaDB directamente: todas las consultas de ranking pasan por la
+# ranking API (https://github.com/josesilvaruiz/sharptimer-ranking-api), que es la
+# misma que consume la landing page, para que ambas muestren siempre lo mismo.
+RANKING_API_URL = os.environ.get("RANKING_API_URL", "http://127.0.0.1:8088")
+RANKING_API_KEY = os.environ["RANKING_API_KEY"]
 
 GUILD_ID = None  # opcional: ID de tu server de Discord (número, sin comillas), para que los comandos aparezcan al instante
 DEFAULT_TOP_N = 10
@@ -93,176 +92,45 @@ def resolve_ephemeral(interaction: discord.Interaction):
     return None
 
 
-# ---------- Acceso a datos ----------
+# ---------- Acceso a datos (via la ranking API, nunca MariaDB directamente) ----------
 
-def get_connection():
-    """Abre la conexion a MariaDB. Solo se usan SELECT, nunca se escribe nada."""
-    return pymysql.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        cursorclass=pymysql.cursors.Cursor,
-        connect_timeout=5,
-    )
+async def _api_get(path: str, **params):
+    url = f"{RANKING_API_URL}{path}"
+    headers = {"X-Api-Key": RANKING_API_KEY}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            resp.raise_for_status()
+            return await resp.json()
 
 
-def fetch_global_top(limit: int):
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            WITH ranked AS (
-                SELECT
-                    SteamID,
-                    PlayerName,
-                    MapName,
-                    Mode,
-                    RANK() OVER (
-                        PARTITION BY MapName, Mode
-                        ORDER BY TimerTicks ASC
-                    ) AS rnk,
-                    COUNT(*) OVER (
-                        PARTITION BY MapName, Mode
-                    ) AS total
-                FROM PlayerRecords
-            )
-            SELECT
-                SteamID,
-                MAX(PlayerName) AS PlayerName,
-                ROUND(SUM(1000.0 * (total - rnk + 1) / total)) AS Points
-            FROM ranked
-            GROUP BY SteamID
-            ORDER BY Points DESC
-            LIMIT %s
-            """,
-            (limit,),
-        )
-        return cur.fetchall()
-    finally:
-        conn.close()
+async def fetch_global_top(limit: int):
+    rows = await _api_get("/top", limit=limit)
+    return [(r["steamId"], r["name"], r["points"]) for r in rows]
 
 
-def fetch_player_rank(query: str):
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        base_query = """
-            WITH ranked AS (
-                SELECT
-                    SteamID,
-                    PlayerName,
-                    MapName,
-                    Mode,
-                    RANK() OVER (
-                        PARTITION BY MapName, Mode
-                        ORDER BY TimerTicks ASC
-                    ) AS rnk,
-                    COUNT(*) OVER (
-                        PARTITION BY MapName, Mode
-                    ) AS total
-                FROM PlayerRecords
-            ),
-            totals AS (
-                SELECT
-                    SteamID,
-                    MAX(PlayerName) AS PlayerName,
-                    ROUND(SUM(1000.0 * (total - rnk + 1) / total)) AS Points
-                FROM ranked
-                GROUP BY SteamID
-            )
-            SELECT PlayerName, Points, SteamID,
-                   (SELECT COUNT(*) + 1 FROM totals AS t2
-                    WHERE t2.Points > t1.Points) AS Position
-            FROM totals AS t1
-            WHERE {where_clause}
-            ORDER BY Points DESC
-            LIMIT 10
-        """
-        if query.isdigit() and len(query) >= 15:
-            cur.execute(base_query.format(where_clause="SteamID = %s"), (query,))
-        else:
-            cur.execute(
-                base_query.format(where_clause="PlayerName LIKE %s"),
-                (f"%{query}%",),
-            )
-        return cur.fetchall()
-    finally:
-        conn.close()
+async def fetch_player_rank(query: str):
+    rows = await _api_get("/rank", q=query)
+    return [(r["name"], r["points"], r["steamId"], r["position"]) for r in rows]
 
 
-def fetch_map_top(map_name: str, limit: int):
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT PlayerName, FormattedTime, TimerTicks, TimesFinished
-            FROM PlayerRecords
-            WHERE MapName = %s
-            ORDER BY TimerTicks ASC
-            LIMIT %s
-            """,
-            (map_name, limit),
-        )
-        return cur.fetchall()
-    finally:
-        conn.close()
+async def fetch_map_top(map_name: str, limit: int):
+    rows = await _api_get("/maptop", map=map_name, limit=limit)
+    return [(r["name"], r["time"], r["finishes"]) for r in rows]
 
 
-def fetch_player_pb_on_map(map_name: str, query: str):
+async def fetch_player_pb_on_map(map_name: str, query: str):
     """
     Busca el PB de un jugador en un mapa concreto, junto a su posición en ese mapa.
     Acepta SteamID exacto o nombre parcial. Devuelve lista de coincidencias:
     [(PlayerName, SteamID, FormattedTime, TimesFinished, Position, TotalPlayers), ...]
     """
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        base_query = """
-            WITH ranked AS (
-                SELECT
-                    SteamID, PlayerName, FormattedTime, TimesFinished,
-                    RANK() OVER (ORDER BY TimerTicks ASC) AS Position,
-                    COUNT(*) OVER () AS TotalPlayers
-                FROM PlayerRecords
-                WHERE MapName = %s
-            )
-            SELECT PlayerName, SteamID, FormattedTime, TimesFinished, Position, TotalPlayers
-            FROM ranked
-            WHERE {where_clause}
-            ORDER BY Position ASC
-            LIMIT 10
-        """
-        if query.isdigit() and len(query) >= 15:
-            cur.execute(base_query.format(where_clause="SteamID = %s"), (map_name, query))
-        else:
-            cur.execute(
-                base_query.format(where_clause="PlayerName LIKE %s"),
-                (map_name, f"%{query}%"),
-            )
-        return cur.fetchall()
-    finally:
-        conn.close()
+    rows = await _api_get("/pb", map=map_name, q=query)
+    return [(r["name"], r["steamId"], r["time"], r["finishes"], r["position"], r["total"]) for r in rows]
 
 
-def list_known_maps_with_counts():
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT MapName, COUNT(DISTINCT SteamID) AS Jugadores
-            FROM PlayerRecords
-            GROUP BY MapName
-            ORDER BY MapName ASC
-            """
-        )
-        return cur.fetchall()
-    finally:
-        conn.close()
+async def list_known_maps_with_counts():
+    rows = await _api_get("/maps")
+    return [(r["map"], r["players"]) for r in rows]
 
 
 def build_help_embed() -> discord.Embed:
@@ -564,7 +432,7 @@ async def on_ready():
         await bot.tree.sync()
     if not check_cs2_patchnotes.is_running():
         check_cs2_patchnotes.start()
-    print(f"Conectado como {bot.user} | Base: {DB_HOST}/{DB_NAME}")
+    print(f"Conectado como {bot.user} | Ranking API: {RANKING_API_URL}")
 
 
 @bot.event
@@ -622,7 +490,7 @@ async def top(interaction: discord.Interaction):
         return
 
     try:
-        rows = fetch_global_top(DEFAULT_TOP_N)
+        rows = await fetch_global_top(DEFAULT_TOP_N)
     except Exception as e:
         await interaction.response.send_message(f"Error leyendo la base: `{e}`", ephemeral=True)
         return
@@ -657,13 +525,13 @@ async def maptop(interaction: discord.Interaction, mapa: str):
         return
 
     try:
-        rows = fetch_map_top(mapa, DEFAULT_TOP_N)
+        rows = await fetch_map_top(mapa, DEFAULT_TOP_N)
     except Exception as e:
         await interaction.response.send_message(f"Error leyendo la base: `{e}`", ephemeral=True)
         return
 
     if not rows:
-        maps = [m[0] for m in list_known_maps_with_counts()]
+        maps = [m[0] for m in await list_known_maps_with_counts()]
         sugerencia = ""
         if maps:
             cercanos = [m for m in maps if mapa.lower() in m.lower()]
@@ -680,7 +548,7 @@ async def maptop(interaction: discord.Interaction, mapa: str):
     )
     medals = ["🥇", "🥈", "🥉"]
     lines = []
-    for i, (name, formatted_time, ticks, finishes) in enumerate(rows, start=1):
+    for i, (name, formatted_time, finishes) in enumerate(rows, start=1):
         prefix = medals[i - 1] if i <= 3 else f"`#{i}`"
         lines.append(f"{prefix} **{name or 'Desconocido'}** — {formatted_time} ({finishes} runs)")
     embed.description = "\n".join(lines)
@@ -701,7 +569,7 @@ async def pb(interaction: discord.Interaction, mapa: str, jugador: str = None):
     busqueda = jugador or interaction.user.display_name
 
     try:
-        rows = fetch_player_pb_on_map(mapa, busqueda)
+        rows = await fetch_player_pb_on_map(mapa, busqueda)
     except Exception as e:
         await interaction.response.send_message(f"Error leyendo la base: `{e}`", ephemeral=True)
         return
@@ -743,7 +611,7 @@ async def rank(interaction: discord.Interaction, jugador: str):
         return
 
     try:
-        rows = fetch_player_rank(jugador)
+        rows = await fetch_player_rank(jugador)
     except Exception as e:
         await interaction.response.send_message(f"Error leyendo la base: `{e}`", ephemeral=True)
         return
@@ -784,7 +652,7 @@ async def maps_cmd(interaction: discord.Interaction):
         return
 
     try:
-        rows = list_known_maps_with_counts()
+        rows = await list_known_maps_with_counts()
     except Exception as e:
         await interaction.response.send_message(f"Error leyendo la base: `{e}`", ephemeral=True)
         return
